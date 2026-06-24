@@ -18,6 +18,7 @@ let settingSubnavFocusTimer = null;
 const SETTING_FAVORITES_GROUP = "__setting_favorites__";
 const SETTING_PROFILES_DIVIDER = "__setting_profiles_divider__";
 const SETTING_PROFILE_GROUP_PREFIX = "__setting_profile__:";
+const SETTING_CATEGORY_DIVIDER_PREFIX = "__setting_category__:";
 const SETTING_FAVORITES_LONG_PRESS_MS = 620;
 const SETTING_FAVORITES_MOVE_TOLERANCE = 10;
 const settingFavoritesState = {
@@ -38,6 +39,52 @@ function isSettingFavoritesGroup(group) {
 
 function isSettingProfilesDivider(entry) {
   return entry?.group === SETTING_PROFILES_DIVIDER || entry === SETTING_PROFILES_DIVIDER;
+}
+
+function isSettingCategoryDivider(entry) {
+  return String(entry?.group || "").startsWith(SETTING_CATEGORY_DIVIDER_PREFIX);
+}
+
+function isSettingAnyDivider(entry) {
+  return isSettingProfilesDivider(entry) || isSettingCategoryDivider(entry);
+}
+
+// 대>중>소 노드(카테고리/그룹/섹션)의 현재 언어 라벨. ko/en/zh 직접 보유 노드용.
+function settingNodeLabel(node) {
+  if (!node) return "";
+  if (LANG === "zh") return node.zh || node.en || node.ko || "";
+  if (LANG === "ko") return node.ko || node.en || node.zh || "";
+  return node.en || node.ko || node.zh || "";
+}
+
+// /api/settings 의 categories(대>중>소)가 있으면 groups/items_by_group 를
+// 중-group id 키 기준으로 정규화한다. 각 항목엔 소-섹션 라벨을 __section 으로 부착.
+// categories 가 없으면(구버전) 아무것도 바꾸지 않아 기존 평면 UI 로 폴백.
+function normalizeSettingCategories(j) {
+  if (!j || !Array.isArray(j.categories) || !j.categories.length) return;
+  const idx = {};
+  Object.values(j.items_by_group || {}).forEach((list) => {
+    (list || []).forEach((it) => { if (it && it.name) idx[it.name] = it; });
+  });
+  const flatGroups = [];
+  const newItemsByGroup = {};
+  j.categories.forEach((cat) => {
+    (cat.groups || []).forEach((g) => {
+      flatGroups.push({ group: g.id, ko: g.ko, en: g.en, zh: g.zh, count: g.count, category: cat.id });
+      const items = [];
+      (g.sections || []).forEach((sec) => {
+        // 라벨이 없어도(단일 직속 섹션) 카드는 만들도록 항상 객체로 둔다.
+        const secLabel = { id: sec.id, ko: sec.ko, en: sec.en, zh: sec.zh };
+        (sec.items || []).forEach((name) => {
+          const def = idx[name];
+          if (def) items.push(Object.assign({}, def, { __section: secLabel }));
+        });
+      });
+      newItemsByGroup[g.id] = items;
+    });
+  });
+  j.groups = flatGroups;
+  j.items_by_group = newItemsByGroup;
 }
 
 function settingProfileGroup(profileId) {
@@ -133,15 +180,29 @@ function getSettingProfilesLabel() {
 }
 
 function getSettingGroupsForDisplay() {
-  const groups = SETTINGS?.groups || [];
   const out = [
     {
       group: SETTING_FAVORITES_GROUP,
       count: getFavoriteSettingEntries().length,
       virtual: true,
     },
-    ...groups,
   ];
+  const cats = SETTINGS?.categories;
+  if (Array.isArray(cats) && cats.length) {
+    cats.forEach((cat) => {
+      out.push({
+        group: SETTING_CATEGORY_DIVIDER_PREFIX + (cat.id || ""),
+        label: settingNodeLabel(cat),
+        divider: true,
+        virtual: true,
+      });
+      (cat.groups || []).forEach((g) => {
+        out.push({ group: g.id, ko: g.ko, en: g.en, zh: g.zh, count: g.count, category: cat.id });
+      });
+    });
+  } else {
+    out.push(...(SETTINGS?.groups || []));
+  }
   const profiles = settingProfilesState.profiles || [];
   if (profiles.length) {
     out.push({
@@ -317,7 +378,7 @@ function applyRestoredSettingValuesToRenderedItems(values) {
     if (!name || !(name in values)) return;
     const valueButton = row.querySelector(".val");
     if (!valueButton) return;
-    valueButton.textContent = String(values[name]);
+    syncSettingControlState(row, values[name]);
     row.classList.add("is-restored-live");
     window.setTimeout(() => row.classList.remove("is-restored-live"), 900);
     updated = true;
@@ -496,6 +557,7 @@ async function loadSettings(options = {}) {
   settingsLoadPromise = (async () => {
     const j = await getJson("/api/settings");
 
+    normalizeSettingCategories(j);
     SETTINGS = j;
     UNIT_CYCLE = j.unit_cycle || UNIT_CYCLE;
     settingValueCache.clear();
@@ -626,7 +688,7 @@ function renderGroups(options = {}) {
   const box = document.getElementById("groupList");
   const animateGroups = options.animateGroups !== false;
   const groups = getSettingGroupsForDisplay();
-  const signature = groups.map((g) => isSettingProfilesDivider(g) ? SETTING_PROFILES_DIVIDER : `${g.group}:${g.count ?? ""}:${g.label || ""}`).join("|");
+  const signature = groups.map((g) => isSettingAnyDivider(g) ? `div:${g.label || ""}` : `${g.group}:${g.count ?? ""}:${g.label || ""}`).join("|");
 
   function setGroupButtonLabel(button, label, count) {
     const text = Number.isFinite(Number(count)) ? `${label} (${count})` : label;
@@ -638,8 +700,8 @@ function renderGroups(options = {}) {
   if (!animateGroups && box.dataset.groupsSignature === signature && box.children.length === groups.length) {
     Array.from(box.children).forEach((button, index) => {
       const g = groups[index];
-      if (isSettingProfilesDivider(g)) {
-        button.className = "setting-profile-divider";
+      if (isSettingAnyDivider(g)) {
+        button.className = isSettingCategoryDivider(g) ? "setting-profile-divider setting-category-divider" : "setting-profile-divider";
         button.innerHTML = `<span></span><strong>${escapeHtml(g.label || getSettingProfilesLabel())}</strong><span></span>`;
         button.removeAttribute("data-group");
         button.onclick = null;
@@ -662,9 +724,10 @@ function renderGroups(options = {}) {
   box.dataset.groupsSignature = signature;
 
   groups.forEach(g => {
-    if (isSettingProfilesDivider(g)) {
+    if (isSettingAnyDivider(g)) {
       const divider = document.createElement("div");
-      divider.className = animateGroups ? "setting-profile-divider ui-stagger-item" : "setting-profile-divider";
+      const base = animateGroups ? "setting-profile-divider ui-stagger-item" : "setting-profile-divider";
+      divider.className = isSettingCategoryDivider(g) ? base + " setting-category-divider" : base;
       if (animateGroups) divider.style.setProperty("--i", String(box.children.length));
       divider.innerHTML = `<span></span><strong>${escapeHtml(g.label || getSettingProfilesLabel())}</strong><span></span>`;
       box.appendChild(divider);
@@ -716,9 +779,236 @@ function getSettingGroupLabel(group) {
   if (profile) return profile.name;
   const meta = getSettingGroupMeta(group);
   if (!meta) return group;
+  if (meta.ko || meta.en || meta.zh) return settingNodeLabel(meta);
   if (LANG === "zh") return meta.cgroup || meta.egroup || meta.group;
   if (LANG === "ko") return meta.group || meta.egroup || group;
   return meta.egroup || meta.group || group;
+}
+
+function getSettingItemContextLabel(group, item) {
+  const groupLabel = getSettingGroupLabel(group);
+  const sectionLabel = item?.__section ? settingNodeLabel(item.__section) : "";
+  if (!sectionLabel || sectionLabel === groupLabel) return groupLabel;
+  return `${groupLabel} > ${sectionLabel}`;
+}
+
+const SETTING_CONTROL_OVERRIDES = {
+  ShowPathMode: { kind: "select" },
+  ShowPathColor: { kind: "select" },
+  ShowPathColorCruiseOff: { kind: "select" },
+  ShowPathModeLane: { kind: "select" },
+  ShowPathColorLane: { kind: "select" },
+  ShowPlotMode: { kind: "select" },
+  ClusterHudScreenMode: { kind: "select" },
+  ClusterHudRadarInfo: { kind: "select" },
+};
+
+function getSettingControlConfig(p) {
+  const override = SETTING_CONTROL_OVERRIDES[p?.name] || {};
+  const min = Number(p?.min);
+  const max = Number(p?.max);
+  const unit = Math.max(1, Number(p?.unit) || 1);
+  const optionCount = Number.isFinite(min) && Number.isFinite(max) ? Math.floor(max - min + 1) : 0;
+  let kind = override.kind || "slider";
+
+  if (!override.kind) {
+    if (min === 0 && max === 1) {
+      kind = "toggle";
+    } else if (Number.isInteger(min) && Number.isInteger(max) && optionCount >= 2 && optionCount <= 4) {
+      kind = "segmented";
+    } else if (Number.isInteger(min) && Number.isInteger(max) && optionCount > 4 && optionCount <= 8) {
+      kind = "select";
+    } else {
+      kind = "slider";
+    }
+  }
+
+  return { kind, min, max, unit, optionCount };
+}
+
+const SETTING_DISPLAY_UNIT_TYPES = Object.freeze({
+  raw: "",
+  speedKph: "km/h",
+  distanceCm: "cm",
+  timeSec: "s",
+  timeMin: "min",
+  percent: "%",
+  degree: "deg",
+});
+
+const SETTING_PARAM_DISPLAY_TYPES = Object.freeze({
+  PathOffset: "distanceCm",
+  CruiseOnDist: "distanceCm",
+  CruiseEcoControl: "speedKph",
+  StopDistanceCarrot: "distanceCm",
+  TrafficStopDistanceAdjust: "distanceCm",
+  AutoTurnControlSpeedTurn: "speedKph",
+  CruiseSpeedUnit: "speedKph",
+  CruiseSpeedUnitBasic: "speedKph",
+  CruiseSpeed1: "speedKph",
+  CruiseSpeed2: "speedKph",
+  CruiseSpeed3: "speedKph",
+  CruiseSpeed4: "speedKph",
+  CruiseSpeed5: "speedKph",
+  AutoGasTokSpeed: "speedKph",
+  AutoGasCancelSpeed: "speedKph",
+  MaxTimeOffroadMin: "timeMin",
+  AutoSpeedUptoRoadSpeedLimit: "percent",
+  AutoRoadSpeedAdjust: "percent",
+  ApplyModelSpeed: "percent",
+  UseLaneLineSpeed: "speedKph",
+  UseLaneLineCurveSpeed: "speedKph",
+  AdjustLaneOffset: "distanceCm",
+  SoundVolumeAdjust: "percent",
+  SoundVolumeAdjustEngage: "percent",
+  AutoCurveSpeedLowerLimit: "speedKph",
+  AutoNaviSpeedCtrlEnd: "timeSec",
+  AutoNaviSpeedBumpTime: "timeSec",
+  AutoNaviSpeedBumpSpeed: "speedKph",
+  AutoRoadSpeedLimitOffset: "speedKph",
+  AutoCurveSpeedFactor: "percent",
+  MapTurnSpeedFactor: "percent",
+  AutoNaviSpeedSafetyFactor: "percent",
+  RadarReactionFactor: "percent",
+  SteerRatioRate: "percent",
+  DynamicTFollowLC: "percent",
+  TFollowDecelBoost: "percent",
+  ShowCustomBrightness: "percent",
+  ClusterHudBrightness: "percent",
+});
+
+function getSettingDisplayType(name) {
+  const key = String(name || "").trim();
+  return SETTING_PARAM_DISPLAY_TYPES[key] || "raw";
+}
+
+function getSettingDisplayUnit(name) {
+  return SETTING_DISPLAY_UNIT_TYPES[getSettingDisplayType(name)] || "";
+}
+
+function formatSettingDisplayValue(p, value) {
+  const text = String(value);
+  const unit = getSettingDisplayUnit(p?.name);
+  return unit ? `${text}${unit}` : text;
+}
+
+function formatSettingRangeMeta(p) {
+  return [
+    `min=${formatSettingDisplayValue(p, p?.min)}`,
+    `max=${formatSettingDisplayValue(p, p?.max)}`,
+    `default=${formatSettingDisplayValue(p, p?.default)}`,
+  ].join(", ");
+}
+
+const SETTING_UNIT_STORAGE_KEY = "carrot.settingUnitIndex.v1";
+let settingUnitIndexStore = null;
+
+function getSettingUnitIndexStore() {
+  if (settingUnitIndexStore) return settingUnitIndexStore;
+  try {
+    settingUnitIndexStore = JSON.parse(localStorage.getItem(SETTING_UNIT_STORAGE_KEY) || "{}") || {};
+  } catch (_) {
+    settingUnitIndexStore = {};
+  }
+  return settingUnitIndexStore;
+}
+
+function saveSettingUnitIndex(name, index) {
+  const key = String(name || "").trim();
+  if (!key) return;
+  try {
+    const store = getSettingUnitIndexStore();
+    store[key] = index;
+    localStorage.setItem(SETTING_UNIT_STORAGE_KEY, JSON.stringify(store));
+  } catch (_) {}
+}
+
+function getSettingUnitIndex(name) {
+  const key = String(name || "").trim();
+  if (!key) return 0;
+  if (!(key in UNIT_INDEX)) {
+    const saved = Number(getSettingUnitIndexStore()[key]);
+    UNIT_INDEX[key] = Number.isInteger(saved) && saved >= 0 && saved < UNIT_CYCLE.length ? saved : 0;
+  }
+  if (!Number.isInteger(UNIT_INDEX[key]) || UNIT_INDEX[key] < 0 || UNIT_INDEX[key] >= UNIT_CYCLE.length) {
+    UNIT_INDEX[key] = 0;
+  }
+  return UNIT_INDEX[key];
+}
+
+function getSettingUnitValue(name) {
+  return UNIT_CYCLE[getSettingUnitIndex(name)] || UNIT_CYCLE[0] || 1;
+}
+
+function setSettingUnitButtonLabel(button, name) {
+  if (button) button.textContent = "x" + getSettingUnitValue(name);
+}
+
+function cycleSettingUnitValue(name) {
+  const key = String(name || "").trim();
+  if (!key) return;
+  UNIT_INDEX[key] = (getSettingUnitIndex(key) + 1) % UNIT_CYCLE.length;
+  saveSettingUnitIndex(key, UNIT_INDEX[key]);
+}
+
+function settingChevronSvg(direction = "left") {
+  const path = direction === "right" ? "M8.75 4.75 16 12l-7.25 7.25" : "M15.25 4.75 8 12l7.25 7.25";
+  return `
+    <svg class="setting-icon setting-icon--chevron" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="${path}"></path>
+    </svg>
+  `;
+}
+
+function setSettingItemsTitle(label) {
+  if (!itemsTitle) return;
+  const safeLabel = escapeHtml(label || "");
+  itemsTitle.innerHTML = `
+    <span class="setting-title-backIcon" aria-hidden="true">${settingChevronSvg("left")}</span>
+    <span class="setting-title-text">${safeLabel}</span>
+  `;
+}
+
+function getSettingOptionValues(config) {
+  if (!config || !Number.isInteger(config.min) || !Number.isInteger(config.max)) return [];
+  const out = [];
+  for (let value = config.min; value <= config.max; value += 1) out.push(value);
+  return out;
+}
+
+function getSettingOptionLabel(name, value) {
+  return formatSettingDisplayValue({ name }, value);
+}
+
+function syncSettingControlState(row, value) {
+  if (!row) return;
+  const text = String(value);
+  const valueButton = row.querySelector(".val");
+  if (valueButton) {
+    const displayText = formatSettingDisplayValue({ name: row.dataset.settingName || "" }, value);
+    valueButton.textContent = displayText;
+    valueButton.dataset.rawValue = text;
+  }
+
+  const toggle = row.querySelector(".setting-switch__input");
+  if (toggle) toggle.checked = Number(value) === 1;
+
+  const slider = row.querySelector(".setting-slider__input");
+  if (slider) slider.value = text;
+
+  row.querySelectorAll(".setting-segment").forEach((button) => {
+    button.classList.toggle("is-active", String(button.dataset.value) === text);
+    button.setAttribute("aria-pressed", String(button.dataset.value) === text ? "true" : "false");
+  });
+
+  const select = row.querySelector(".setting-select");
+  if (select) {
+    select.value = text;
+    if (select.tagName === "BUTTON") {
+      select.dataset.value = text;
+      select.textContent = getSettingOptionLabel(row.dataset.settingName || "", value);
+    }
+  }
 }
 
 const SETTING_SUBNAV_PAGE_STEP = 1;
@@ -731,6 +1021,7 @@ let settingSearchEntries = [];
 let settingSearchScope = { type: "all", profileId: "" };
 const settingPageRoot = document.getElementById("pageSetting");
 let settingFabMenuOpen = false;
+let CURRENT_SETTING_DETAIL = null;
 
 function isCompactLandscapeMode() {
   return window.matchMedia("(orientation: landscape)").matches;
@@ -839,42 +1130,6 @@ function formatSettingProfileDate(value) {
   } catch {
     return raw;
   }
-}
-
-function settingProfileMetaRows(profile) {
-  const meta = profile?.meta || {};
-  const rows = [];
-  if (profile?.created_at) {
-    rows.push([getUIText("setting_profile_created", "Created"), settingsDiffEscape(formatSettingProfileDate(profile.created_at))]);
-  }
-  if (meta.branch) rows.push([getUIText("branch", "Branch"), settingsDiffEscape(meta.branch)]);
-  if (meta.commit) {
-    const commitText = meta.commit_short || String(meta.commit).slice(0, 7);
-    const commitValue = meta.commit_url
-      ? `<a href="${settingsDiffEscape(meta.commit_url)}" target="_blank" rel="noopener">${settingsDiffEscape(commitText)}</a>`
-      : settingsDiffEscape(commitText);
-    rows.push([getUIText("commit", "Commit"), commitValue]);
-  }
-  return rows;
-}
-
-async function openSettingProfileInfo(profile) {
-  const rows = settingProfileMetaRows(profile);
-  const messageHtml = rows.length
-    ? `<div class="setting-profile-info">${rows.map(([label, value]) => `
-        <div class="setting-profile-panel__metaRow">
-          <span>${settingsDiffEscape(label)}</span>
-          <strong>${value}</strong>
-        </div>
-      `).join("")}</div>`
-    : `<div class="setting-profile-info setting-profile-info--empty">${settingsDiffEscape(getUIText("setting_profile_info_empty", "No profile metadata"))}</div>`;
-  await openAppDialog({
-    mode: "alert",
-    title: getUIText("setting_profile_info", "Profile Info"),
-    html: true,
-    messageHtml,
-    confirmLabel: getUIText("ok", "OK"),
-  });
 }
 
 async function saveSettingProfile(profileId, updates) {
@@ -990,11 +1245,11 @@ async function deleteSettingProfile(profile) {
 }
 
 function closeSettingProfileActionMenus(exceptPanel = null) {
-  document.querySelectorAll(".setting-profile-action-menu.is-open").forEach((menu) => {
+  document.querySelectorAll(".setting-profile-menu.is-open").forEach((menu) => {
     if (exceptPanel && menu === exceptPanel) return;
     menu.classList.remove("is-open");
-    const button = menu.querySelector(".setting-profile-action-menu__button");
-    const panel = menu.querySelector(".setting-profile-action-menu__panel");
+    const button = menu.querySelector(".setting-profile-menu__button");
+    const panel = menu.querySelector(".setting-profile-menu__panel");
     if (button) button.setAttribute("aria-expanded", "false");
     if (panel) {
       panel.hidden = true;
@@ -1003,38 +1258,84 @@ function closeSettingProfileActionMenus(exceptPanel = null) {
   });
 }
 
-function makeSettingProfileMenuItem(label, onClick, className = "") {
+function settingProfileActionIcon(kind) {
+  const paths = {
+    edit: "M4 20h4l10.5-10.5a2.12 2.12 0 0 0-3-3L5 17v3m11-12 3 3",
+    search: "M10.5 18a7.5 7.5 0 1 1 5.3-12.8 7.5 7.5 0 0 1 0 10.6L20 20",
+    info: "M12 17v-6m0-4h.01M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20",
+    apply: "m5 12 4 4L19 6",
+    delete: "M6 7h12m-10 0 .7 13h6.6L16 7M10 7V4h4v3",
+  };
+  const path = paths[kind] || paths.info;
+  return `
+    <svg class="setting-profile-action__icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="${path}"></path>
+    </svg>
+  `;
+}
+
+function makeSettingProfileMenuItem({ label, icon = "info", onClick, className = "" }) {
   const button = document.createElement("button");
   button.type = "button";
-  button.className = `setting-profile-action-menu__item ui-dropdown-menu__item${className ? ` ${className}` : ""}`;
+  button.className = `setting-profile-menu__item ui-dropdown-menu__item${className ? ` ${className}` : ""}`;
   button.setAttribute("role", "menuitem");
-  button.textContent = label;
+  button.innerHTML = `
+    ${settingProfileActionIcon(icon)}
+    <span>${settingsDiffEscape(label)}</span>
+  `;
   button.onclick = (event) => {
     event.stopPropagation();
     closeSettingProfileActionMenus();
-    onClick();
+    if (typeof onClick === "function") onClick();
   };
   return button;
 }
 
-function appendSettingProfileHeader(profile, container) {
-  const panel = document.createElement("div");
-  panel.className = "setting-profile-panel";
+function renderSettingProfileMetaRows(profile) {
+  const meta = profile?.meta || {};
+  const created = profile?.created_at ? settingsDiffEscape(formatSettingProfileDate(profile.created_at)) : "-";
+  const branch = meta.branch ? settingsDiffEscape(meta.branch) : "-";
+  let commit = "-";
+  if (meta.commit) {
+    const commitText = meta.commit_short || String(meta.commit).slice(0, 7);
+    commit = meta.commit_url
+      ? `<a href="${settingsDiffEscape(meta.commit_url)}" target="_blank" rel="noopener">${settingsDiffEscape(commitText)}</a>`
+      : settingsDiffEscape(commitText);
+  }
+  return [
+    [getUIText("setting_profile_created", "Created"), created],
+    [getUIText("branch", "Branch"), branch],
+    [getUIText("commit", "Commit"), commit],
+  ];
+}
 
-  const titleRow = document.createElement("div");
-  titleRow.className = "setting-profile-panel__titleRow";
-  const input = document.createElement("input");
-  input.className = "setting-profile-panel__name";
-  input.type = "text";
-  input.maxLength = 40;
-  input.value = profile.name || "";
-  input.setAttribute("aria-label", getUIText("setting_profile_name", "Profile name"));
+function appendSettingProfileHeader(profile, container) {
+  if (!container || !profile) return;
+  const panel = document.createElement("div");
+  panel.className = "setting-profile-panel setting-section-block ui-stagger-item";
+
+  const card = document.createElement("div");
+  card.className = "setting-profile-manage-card setting-group-card";
+  const valueCount = Object.keys(profile.values || {}).length;
+
+  const nameRow = document.createElement("div");
+  nameRow.className = "setting-profile-row setting-profile-row--name";
+  const nameLabel = document.createElement("div");
+  nameLabel.className = "setting-profile-row__label";
+  nameLabel.textContent = getUIText("setting_profile_card_title", "Profile ({count})", { count: valueCount });
+  const nameInput = document.createElement("input");
+  nameInput.className = "setting-profile-name-input";
+  nameInput.type = "text";
+  nameInput.maxLength = 40;
+  nameInput.value = profile.name || "";
+  nameInput.setAttribute("aria-label", getUIText("setting_profile_name", "Profile name"));
+
   let nameSaveTimer = 0;
   let nameSaveInFlight = null;
   async function persistProfileName() {
-    const nextName = input.value.trim();
+    const nextName = nameInput.value.trim();
     if (!nextName) {
-      input.value = profile.name || "";
+      nameInput.value = profile.name || "";
       return;
     }
     if (nextName === profile.name) return;
@@ -1043,49 +1344,51 @@ function appendSettingProfileHeader(profile, container) {
       if (nextName === profile.name) return;
     }
     try {
-      input.classList.add("is-saving");
+      nameInput.classList.add("is-saving");
       nameSaveInFlight = saveSettingProfile(profile.id, { name: nextName });
       const nextProfile = await nameSaveInFlight;
       if (nextProfile) profile.name = nextProfile.name;
-      if (itemsTitle) itemsTitle.textContent = profile.name;
       renderGroups({ animateGroups: false });
       renderSettingSubnav();
+      setSettingItemsTitle(profile.name);
+      showAppToast(getUIText("setting_profile_saved", "Profile saved"));
     } catch (e) {
       showAppToast(e?.message || getUIText("setting_profile_save_failed", "Failed to save profile"), { tone: "error" });
     } finally {
       nameSaveInFlight = null;
-      input.classList.remove("is-saving");
+      nameInput.classList.remove("is-saving");
     }
   }
-  function scheduleProfileNameSave(delay = 500) {
+  function scheduleProfileNameSave(delay = 650) {
     if (nameSaveTimer) clearTimeout(nameSaveTimer);
     nameSaveTimer = window.setTimeout(() => {
       nameSaveTimer = 0;
       persistProfileName().catch(() => {});
     }, delay);
   }
-  input.addEventListener("input", () => scheduleProfileNameSave());
-  input.addEventListener("blur", () => {
+  nameInput.addEventListener("input", () => scheduleProfileNameSave());
+  nameInput.addEventListener("blur", () => {
     if (nameSaveTimer) {
       clearTimeout(nameSaveTimer);
       nameSaveTimer = 0;
     }
     persistProfileName().catch(() => {});
   });
-  input.addEventListener("keydown", (event) => {
+  nameInput.addEventListener("keydown", (event) => {
     if (event.key !== "Enter") return;
     event.preventDefault();
     if (nameSaveTimer) {
       clearTimeout(nameSaveTimer);
       nameSaveTimer = 0;
     }
-    persistProfileName().then(() => input.blur()).catch(() => {});
+    persistProfileName().then(() => nameInput.blur()).catch(() => {});
   });
+
   const menu = document.createElement("div");
-  menu.className = "setting-profile-action-menu ui-dropdown-menu";
+  menu.className = "setting-profile-menu ui-dropdown-menu";
   const menuBtn = document.createElement("button");
   menuBtn.type = "button";
-  menuBtn.className = "setting-profile-action-menu__button ui-dropdown-menu__button";
+  menuBtn.className = "setting-profile-menu__button ui-dropdown-menu__button";
   menuBtn.setAttribute("aria-haspopup", "menu");
   menuBtn.setAttribute("aria-expanded", "false");
   menuBtn.setAttribute("aria-label", getUIText("setting_profile_menu", "Profile menu"));
@@ -1095,28 +1398,27 @@ function appendSettingProfileHeader(profile, container) {
     </svg>
   `;
   const menuPanel = document.createElement("div");
-  menuPanel.className = "setting-profile-action-menu__panel ui-dropdown-menu__panel";
+  menuPanel.className = "setting-profile-menu__panel ui-dropdown-menu__panel";
   menuPanel.setAttribute("role", "menu");
   menuPanel.setAttribute("aria-hidden", "true");
   menuPanel.hidden = true;
-  menuPanel.appendChild(makeSettingProfileMenuItem(
-    getUIText("setting_profile_search", "Search Profile"),
-    () => openSettingSearchPanel({ scope: { type: "profile", profileId: profile.id } }).catch(() => {}),
-  ));
-  menuPanel.appendChild(makeSettingProfileMenuItem(
-    getUIText("setting_profile_info", "Info"),
-    () => openSettingProfileInfo(profile),
-  ));
-  menuPanel.appendChild(makeSettingProfileMenuItem(
-    getUIText("apply", "Apply"),
-    () => applySettingProfile(profile),
-    "setting-profile-action-menu__item--primary",
-  ));
-  menuPanel.appendChild(makeSettingProfileMenuItem(
-    getUIText("delete", "Delete"),
-    () => deleteSettingProfile(profile),
-    "setting-profile-action-menu__item--danger",
-  ));
+  menuPanel.appendChild(makeSettingProfileMenuItem({
+    label: getUIText("apply", "Apply"),
+    icon: "apply",
+    onClick: () => applySettingProfile(profile),
+    className: "setting-profile-menu__item--primary",
+  }));
+  menuPanel.appendChild(makeSettingProfileMenuItem({
+    label: getUIText("setting_profile_search", "Search Profile"),
+    icon: "search",
+    onClick: () => openSettingSearchPanel({ scope: { type: "profile", profileId: profile.id } }).catch(() => {}),
+  }));
+  menuPanel.appendChild(makeSettingProfileMenuItem({
+    label: getUIText("delete", "Delete"),
+    icon: "delete",
+    onClick: () => deleteSettingProfile(profile),
+    className: "setting-profile-menu__item--danger",
+  }));
   menuBtn.onclick = (event) => {
     event.stopPropagation();
     const nextOpen = !menu.classList.contains("is-open");
@@ -1128,10 +1430,31 @@ function appendSettingProfileHeader(profile, container) {
   };
   menu.appendChild(menuBtn);
   menu.appendChild(menuPanel);
-  titleRow.appendChild(input);
-  titleRow.appendChild(menu);
 
-  panel.appendChild(titleRow);
+  const rows = document.createElement("div");
+  rows.className = "setting-profile-card__rows";
+
+  nameRow.appendChild(nameLabel);
+  nameRow.appendChild(nameInput);
+  nameRow.appendChild(menu);
+  rows.appendChild(nameRow);
+
+  renderSettingProfileMetaRows(profile).forEach(([label, value]) => {
+    const row = document.createElement("div");
+    row.className = "setting-profile-row";
+    const rowLabel = document.createElement("div");
+    rowLabel.className = "setting-profile-row__label";
+    rowLabel.textContent = label;
+    const rowValue = document.createElement("div");
+    rowValue.className = "setting-profile-row__value";
+    rowValue.innerHTML = value;
+    row.appendChild(rowLabel);
+    row.appendChild(rowValue);
+    rows.appendChild(row);
+  });
+
+  card.appendChild(rows);
+  panel.appendChild(card);
   container.appendChild(panel);
 }
 
@@ -1191,6 +1514,7 @@ function mountSettingSearchOverlay() {
 
 function makeSettingSearchEntry({ source, profile = null, group, item }) {
   const groupLabel = getSettingGroupLabel(group);
+  const contextGroupLabel = getSettingItemContextLabel(group, item);
   const title = formatItemText(item, "title", "etitle", "");
   const descr = formatItemText(item, "descr", "edescr", "");
   const isProfile = source === "profile" && profile?.id;
@@ -1199,8 +1523,8 @@ function makeSettingSearchEntry({ source, profile = null, group, item }) {
     ? getUIText("setting_search_source_profile", "Profile")
     : getUIText("setting_search_source_carrot", "CarrotPilot");
   const contextLabel = isProfile
-    ? `${profileName} / ${groupLabel}`
-    : groupLabel;
+    ? `${profileName} / ${contextGroupLabel}`
+    : contextGroupLabel;
 
   return {
     source: isProfile ? "profile" : "carrot",
@@ -1210,11 +1534,12 @@ function makeSettingSearchEntry({ source, profile = null, group, item }) {
     group: isProfile ? settingProfileGroup(profile.id) : group,
     originalGroup: group,
     groupLabel,
+    contextGroupLabel,
     contextLabel,
     name: item.name,
     title,
     descr,
-    haystack: [sourceLabel, profileName, groupLabel, item.name, title, descr].join("\n").toLowerCase(),
+    haystack: [sourceLabel, profileName, groupLabel, contextGroupLabel, item.name, title, descr].join("\n").toLowerCase(),
   };
 }
 
@@ -1303,8 +1628,17 @@ function hasSettingViewportLayoutChanged() {
   );
 }
 
+function isPortraitInternalScrollMode() {
+  return Boolean(window.matchMedia && window.matchMedia("(max-width: 640px) and (orientation: portrait)").matches);
+}
+
 function getSettingItemsScrollContainer() {
   if (isCompactLandscapeMode() && screenItems) return screenItems;
+  // 세로 구조(뷰포트 고정 높이 + 화면 내부 스크롤)에서는 활성 화면이 스크롤러다.
+  if (isPortraitInternalScrollMode()) {
+    if (screenItems && screenItems.style.display !== "none" && !screenItems.classList.contains("hidden")) return screenItems;
+    if (screenGroups && screenGroups.style.display !== "none" && !screenGroups.classList.contains("hidden")) return screenGroups;
+  }
   return document.scrollingElement || document.documentElement || document.body;
 }
 
@@ -1363,7 +1697,7 @@ function resetSettingItemsViewport() {
 function hasRenderedSettingItems(group = CURRENT_GROUP) {
   const itemsBox = document.getElementById("items");
   if (!itemsBox || !group) return false;
-  return itemsBox.dataset.renderedGroup === group && itemsBox.childElementCount > 0;
+  return itemsBox.dataset.renderedGroup === group && !itemsBox.dataset.renderedDetail && itemsBox.childElementCount > 0;
 }
 
 function isCarrotSettingTabActive() {
@@ -1373,12 +1707,65 @@ function isCarrotSettingTabActive() {
 function syncSettingGroupChrome(group = CURRENT_GROUP) {
   const meta = document.getElementById("groupMeta");
   const list = getSettingItemEntriesForGroup(group);
-  if (meta && group) meta.textContent = `${group} / ${list.length}`;
+  const profile = getSettingProfileByGroup(group);
   const groupLabel = group ? getSettingGroupLabel(group) : "";
+  if (CURRENT_SETTING_DETAIL) {
+    const detailEntry = getSettingDetailEntry(group, CURRENT_SETTING_DETAIL);
+    const detailTitle = detailEntry?.item ? getSettingDetailTitle(detailEntry.item) : CURRENT_SETTING_DETAIL;
+    if (meta && group) meta.textContent = `${group} / 1`;
+    if (group) {
+      settingTitle.textContent = (UI_STRINGS[LANG].setting || "Setting") + " - " + detailTitle;
+      setSettingItemsTitle(detailTitle);
+    }
+    return;
+  }
+  if (meta && group) {
+    meta.classList.remove("setting-profile-meta");
+    meta.textContent = profile ? "" : `${group} / ${list.length}`;
+  }
   if (group) {
     settingTitle.textContent = (UI_STRINGS[LANG].setting || "Setting") + " - " + groupLabel;
-    if (itemsTitle) itemsTitle.textContent = groupLabel;
+    setSettingItemsTitle(groupLabel);
   }
+}
+
+function getSettingDetailEntry(group, name) {
+  const target = String(name || "").trim();
+  if (!target) return null;
+  const entries = getSettingItemEntriesForGroup(group);
+  return entries.find((entry) => entry?.item?.name === target) || null;
+}
+
+function getSettingDetailTitle(item) {
+  return formatItemText(item, "title", "etitle", item?.name || "");
+}
+
+function isSettingInlineControlTarget(target) {
+  return Boolean(target?.closest?.(".ctrl, button, input, select, textarea, a"));
+}
+
+async function selectSettingDetail(group, name, pushHistory = true) {
+  const targetGroup = group || CURRENT_GROUP;
+  const targetName = String(name || "").trim();
+  if (!targetGroup || !targetName) return;
+
+  saveCurrentSettingScrollPosition(targetGroup);
+  CURRENT_GROUP = targetGroup;
+  CURRENT_SETTING_DETAIL = targetName;
+  if (pushHistory) {
+    history.pushState({
+      page: "setting",
+      screen: "detail",
+      group: targetGroup,
+      settingName: targetName,
+    }, "");
+  }
+  await transitionSettingItemsContent(() => renderItems(targetGroup, {
+    detailName: targetName,
+    scrollMode: "top",
+    animateItems: false,
+    forceValues: true,
+  }), "forward");
 }
 
 function settingMarqueeHtml(text, className) {
@@ -1545,8 +1932,8 @@ function renderSettingSearchResults(query = "") {
       button.type = "button";
       button.className = "setting-search-result";
       const metaLabel = entry.source === "profile"
-        ? `${entry.profileName} / ${entry.groupLabel}`
-        : entry.groupLabel;
+        ? `${entry.profileName} / ${entry.contextGroupLabel || entry.groupLabel}`
+        : entry.contextGroupLabel || entry.groupLabel;
       button.innerHTML = `
         <div class="setting-search-result__group">${highlightSettingSearchText(metaLabel, trimmed)}</div>
         <div class="setting-search-result__title">${highlightSettingSearchText(entry.title || entry.name, trimmed)}</div>
@@ -1560,7 +1947,7 @@ function renderSettingSearchResults(query = "") {
             settingProfileSectionExpandedState.set(`${entry.profileId}:${entry.originalGroup}`, true);
           }
           closeSettingSearchPanel({ syncHistory: false });
-          if (CURRENT_GROUP === entry.group && screenItems && screenItems.style.display !== "none") {
+          if (CURRENT_GROUP === entry.group && !CURRENT_SETTING_DETAIL && screenItems && screenItems.style.display !== "none") {
             focusSettingItem(entry.name);
             return;
           }
@@ -1579,7 +1966,6 @@ async function openSettingSearchPanel(options = {}) {
   const scope = options.scope || { type: "all", profileId: "" };
   if (CURRENT_PAGE !== "setting") return;
   closeSettingFabMenu();
-  closeSettingProfileActionMenus();
   if (!SETTINGS) {
     try {
       await loadSettings();
@@ -1603,8 +1989,9 @@ async function openSettingSearchPanel(options = {}) {
   if (pushHistory && !(state.page === "setting" && state.search)) {
     history.pushState({
       page: "setting",
-      screen: (screenItems && screenItems.style.display !== "none") ? "items" : "groups",
+      screen: CURRENT_SETTING_DETAIL ? "detail" : ((screenItems && screenItems.style.display !== "none") ? "items" : "groups"),
       group: CURRENT_GROUP || null,
+      settingName: CURRENT_SETTING_DETAIL || null,
       search: true,
       searchScope: settingSearchScope.type,
       profileId: settingSearchScope.profileId || null,
@@ -1624,16 +2011,19 @@ async function openSettingSearchPanel(options = {}) {
   });
 }
 
-function toggleSettingSearchPanel() {
-  if (!settingSearchPanel) return;
-  if (settingSearchPanel.hidden) {
-    openSettingSearchPanel().catch(() => {});
-  }
-  else closeSettingSearchPanel({ syncHistory: true });
-}
-
 if (btnSettingSearch) {
-  btnSettingSearch.onclick = () => toggleSettingFabMenu();
+  btnSettingSearch.addEventListener("animationend", (event) => {
+    if (event.animationName === "setting-fab-bounce") {
+      btnSettingSearch.classList.remove("is-bouncing");
+    }
+  });
+  btnSettingSearch.onclick = () => {
+    // 빠른 연타에도 바운스가 다시 재생되도록 클래스 제거 후 reflow 강제
+    btnSettingSearch.classList.remove("is-bouncing");
+    void btnSettingSearch.offsetWidth;
+    btnSettingSearch.classList.add("is-bouncing");
+    toggleSettingFabMenu();
+  };
 }
 
 if (btnSettingFabSearch) {
@@ -1716,8 +2106,9 @@ window.addEventListener("keydown", (e) => {
     closeSettingSearchPanel({ syncHistory: true });
     return;
   }
-  if (e.key === "Escape") {
+  if (e.key === "Escape" && document.querySelector(".setting-profile-menu.is-open")) {
     closeSettingProfileActionMenus();
+    return;
   }
   if (e.key === "Escape" && settingFabMenuOpen) {
     closeSettingFabMenu();
@@ -1725,18 +2116,18 @@ window.addEventListener("keydown", (e) => {
 });
 
 document.addEventListener("pointerdown", (e) => {
-  if (!(e.target instanceof Element && e.target.closest(".setting-profile-action-menu"))) {
+  if (!(e.target instanceof Element) || !e.target.closest(".setting-profile-menu")) {
     closeSettingProfileActionMenus();
   }
-  if (!settingFabMenuOpen || !settingFabMenu) return;
-  if (settingFabMenu.contains(e.target)) return;
-  closeSettingFabMenu();
+  if (settingFabMenuOpen && settingFabMenu && !settingFabMenu.contains(e.target)) {
+    closeSettingFabMenu();
+  }
 });
 
 window.addEventListener("carrot:pagechange", (event) => {
   if (event?.detail?.page !== "setting") {
-    closeSettingFabMenu();
     closeSettingProfileActionMenus();
+    closeSettingFabMenu();
   }
 });
 
@@ -1752,12 +2143,27 @@ function updateSettingSubnavLayoutState() {
   syncSettingSubnavFixedOffset();
 }
 
+function getCurrentSettingCategoryId() {
+  if (!Array.isArray(SETTINGS?.categories) || !SETTINGS.categories.length) return null;
+  const meta = (SETTINGS?.groups || []).find((g) => g.group === CURRENT_GROUP);
+  return meta?.category || null;
+}
+
 function getSettingSubnavGroups() {
-  return getSettingGroupsForDisplay().filter((entry) =>
+  const all = getSettingGroupsForDisplay().filter((entry) =>
     !isSettingProfilesDivider(entry) &&
+    !isSettingCategoryDivider(entry) &&
     !isSettingFavoritesGroup(entry.group) &&
     !isSettingProfileGroup(entry.group)
   );
+  // 카테고리 모드: 서브내비(퀵링크)를 현재 카테고리의 그룹만으로 한정 → footprint 축소.
+  // 다른 카테고리는 뒤로가기(그룹목록)로 전환. CURRENT_GROUP 이 가상/없으면 전체 유지.
+  const catId = getCurrentSettingCategoryId();
+  if (catId) {
+    const scoped = all.filter((entry) => entry.category === catId);
+    if (scoped.length) return scoped;
+  }
+  return all;
 }
 
 function getSettingSubnavGroupIndex(group = CURRENT_GROUP) {
@@ -1781,16 +2187,97 @@ function getSettingSubnavShiftTarget(direction) {
   };
 }
 
-function stripIdsFromClone(root) {
-  if (!root) return;
-  if (root.id) root.removeAttribute("id");
-  root.querySelectorAll("[id]").forEach((node) => node.removeAttribute("id"));
+async function transitionSettingItemsContent(renderContent, direction = "forward") {
+  if (typeof renderContent !== "function") return false;
+
+  const reduceMotion = Boolean(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  const canAnimate =
+    !window.__CARROT_WEB_BOOTSTRAPPING &&
+    !reduceMotion &&
+    !isCompactLandscapeMode() &&
+    !settingGroupTransitionLock &&
+    settingScreenHost &&
+    screenItems &&
+    screenItems.style.display !== "none" &&
+    !screenItems.classList.contains("hidden");
+
+  if (!canAnimate) {
+    if (screenItems && (screenItems.style.display === "none" || screenItems.classList.contains("hidden"))) {
+      showSettingScreen("items", false);
+    }
+    await renderContent();
+    return false;
+  }
+
+  settingGroupTransitionLock = true;
+  const snapshot = screenItems.cloneNode(true);
+  snapshot.classList.add("setting-screen-snapshot");
+  snapshot.querySelectorAll(".is-longpressing, .is-bouncing").forEach((el) => {
+    el.classList.remove("is-longpressing", "is-bouncing");
+  });
+  snapshot.setAttribute("aria-hidden", "true");
+  snapshot.style.pointerEvents = "none";
+
+  try {
+    settingScreenHost.classList.add("setting-screen-transitioning");
+    document.getElementById("pageSetting")?.classList.add("setting-screen-transitioning");
+    settingScreenHost.appendChild(snapshot);
+    prepareSwipeFrame(settingScreenHost, snapshot);
+    snapshot.style.zIndex = "1";
+    screenItems.style.visibility = "hidden";
+    screenItems.style.pointerEvents = "none";
+
+    await renderContent();
+
+    screenItems.querySelectorAll(".ui-stagger-item").forEach((el) => el.classList.remove("ui-stagger-item"));
+    screenItems.style.visibility = "";
+    const frame = prepareSwipeFrame(settingScreenHost, snapshot, screenItems);
+    if (!frame) {
+      resetPageRuntimeStyles(screenItems);
+      snapshot.remove();
+      settingScreenHost.classList.remove("setting-screen-transitioning");
+      document.getElementById("pageSetting")?.classList.remove("setting-screen-transitioning");
+      settingGroupTransitionLock = false;
+      return false;
+    }
+
+    applySwipeDrag(frame, 0, direction, false, { fade: false });
+    await new Promise((resolve) => {
+      settleSwipe(frame, direction, true, resolve, {
+        durationMs: SETTING_SCREEN_SLIDE_MS,
+        easing: SETTING_SCREEN_SLIDE_EASE,
+        fade: false,
+      });
+    });
+
+    clearPageTransitionClasses(screenItems);
+    resetPageRuntimeStyles(screenItems);
+    snapshot.remove();
+    settingScreenHost.style.minHeight = "";
+    settingScreenHost.classList.remove("setting-screen-transitioning");
+    document.getElementById("pageSetting")?.classList.remove("setting-screen-transitioning");
+    settingGroupTransitionLock = false;
+    scheduleSettingOverflowSync(screenItems);
+    return true;
+  } catch (e) {
+    clearPageTransitionClasses(screenItems);
+    resetPageRuntimeStyles(screenItems);
+    if (snapshot.parentElement) snapshot.remove();
+    if (settingScreenHost) {
+      settingScreenHost.style.minHeight = "";
+      settingScreenHost.classList.remove("setting-screen-transitioning");
+    }
+    document.getElementById("pageSetting")?.classList.remove("setting-screen-transitioning");
+    settingGroupTransitionLock = false;
+    throw e;
+  }
 }
 
 async function activateSettingGroup(group, pushHistory = true, options = {}) {
   if (!isCarrotSettingTabActive()) return;
   const nextGroup = group || CURRENT_GROUP;
   const previousGroup = CURRENT_GROUP;
+  CURRENT_SETTING_DETAIL = null;
   const scrollMode = options.scrollMode || "top";
   const animateItems = options.animateItems !== false;
   const animateGroups = options.animateGroups !== false;
@@ -1804,7 +2291,9 @@ async function activateSettingGroup(group, pushHistory = true, options = {}) {
   }
 
   CURRENT_GROUP = group;
-  renderGroups({ animateGroups });
+  // 드릴인 시 그룹 목록을 재생성/재-stagger 하지 않는다 — 그 변화가 '슬라이드로 나가는 중인'
+  // 최상위 메뉴에 보여서 어색했다. 활성 표시만 제자리 갱신(reuse 경로)한다.
+  renderGroups({ animateGroups: false });
   if (isCompactLandscapeMode() && CURRENT_PAGE === "setting") {
     showSettingScreen("items", false);
     history.replaceState({ page: "setting", screen: "items", group: CURRENT_GROUP || null }, "");
@@ -1830,13 +2319,13 @@ async function activateSettingGroup(group, pushHistory = true, options = {}) {
     return;
   }
 
-  showSettingScreen("items", pushHistory);
-  if (!pushHistory) {
-    history.replaceState({ page: "setting", screen: "items", group: CURRENT_GROUP || null }, "");
-  }
-  syncSettingGroupChrome(group);
-  if (typeof centerActiveSettingSubnavTab === "function") centerActiveSettingSubnavTab("auto");
   if (canReuseRenderedGroup) {
+    showSettingScreen("items", pushHistory);
+    if (!pushHistory) {
+      history.replaceState({ page: "setting", screen: "items", group: CURRENT_GROUP || null }, "");
+    }
+    syncSettingGroupChrome(group);
+    if (typeof centerActiveSettingSubnavTab === "function") centerActiveSettingSubnavTab("auto");
     requestAnimationFrame(() => {
       if (scrollMode === "restore") {
         setSettingItemsScrollTop(
@@ -1848,11 +2337,20 @@ async function activateSettingGroup(group, pushHistory = true, options = {}) {
     });
     return;
   }
+  // 단계 진입(items)은 좌우 슬라이드로만 보여준다 — 행별 세로 stagger 없이
+  // 한 덩어리로 슬라이드 인 (One UI). 세로 stagger 는 설정 첫 진입에서만.
   await renderItems(group, {
     scrollMode,
     scrollTop: options.scrollTop,
-    animateItems,
+    animateItems: false,
+    allowHidden: true,
   });
+  showSettingScreen("items", pushHistory);
+  if (!pushHistory) {
+    history.replaceState({ page: "setting", screen: "items", group: CURRENT_GROUP || null }, "");
+  }
+  syncSettingGroupChrome(group);
+  if (typeof centerActiveSettingSubnavTab === "function") centerActiveSettingSubnavTab("auto");
 }
 
 async function animateSettingGroupSwitch(group, direction = "forward") {
@@ -1861,47 +2359,16 @@ async function animateSettingGroupSwitch(group, direction = "forward") {
     return;
   }
 
-  if (settingGroupTransitionLock || !settingScreenHost || !screenItems || screenItems.style.display === "none") {
+  if (settingGroupTransitionLock || !settingScreenHost || !screenItems) {
     await activateSettingGroup(group, false);
     return;
   }
 
-  settingGroupTransitionLock = true;
   if (typeof stopSettingSubnavMotion === "function") stopSettingSubnavMotion();
-
-  const snapshot = screenItems.cloneNode(true);
-  stripIdsFromClone(snapshot);
-  snapshot.setAttribute("aria-hidden", "true");
-  snapshot.style.pointerEvents = "none";
-
-  try {
-    settingScreenHost.appendChild(snapshot);
-    prepareSwipeFrame(settingScreenHost, snapshot);
-    screenItems.style.visibility = "hidden";
-    await activateSettingGroup(group, false);
-    screenItems.style.visibility = "";
-    const frame = prepareSwipeFrame(settingScreenHost, snapshot, screenItems);
-    if (!frame) {
-      snapshot.remove();
-      settingGroupTransitionLock = false;
-      return;
-    }
-
-    applySwipeDrag(frame, 0, direction);
-    settleSwipe(frame, direction, true, () => {
-      clearPageTransitionClasses(screenItems);
-      resetPageRuntimeStyles(screenItems);
-      if (snapshot.parentElement) snapshot.remove();
-      settingScreenHost.style.minHeight = "";
-      settingGroupTransitionLock = false;
-    });
-  } catch (e) {
-    screenItems.style.visibility = "";
-    if (snapshot.parentElement) snapshot.remove();
-    settingScreenHost.style.minHeight = "";
-    settingGroupTransitionLock = false;
-    throw e;
-  }
+  await transitionSettingItemsContent(
+    () => activateSettingGroup(group, false, { animateGroups: false, animateItems: false }),
+    direction,
+  );
 }
 
 function getCenteredSettingSubnavGroup() {
@@ -2167,21 +2634,33 @@ async function renderItems(group, options = {}) {
   const meta = document.getElementById("groupMeta");
   const itemsBox = document.getElementById("items");
   const renderToken = ++settingRenderToken;
+  const detailName = String(options.detailName || "").trim();
+  const detailMode = Boolean(detailName);
   const scrollMode = options.scrollMode || "top";
   const animateItems = options.animateItems !== false;
+  const allowHidden = options.allowHidden === true;
   const requestedScrollTop = Number.isFinite(options.scrollTop) ? options.scrollTop : null;
   itemsBox.innerHTML = "";
   delete itemsBox.dataset.renderedGroup;
+  delete itemsBox.dataset.renderedDetail;
   renderSettingSubnav();
 
-  const entries = getSettingItemEntriesForGroup(group);
+  const allEntries = getSettingItemEntriesForGroup(group);
+  const detailEntry = detailMode ? getSettingDetailEntry(group, detailName) : null;
+  const entries = detailMode ? (detailEntry ? [detailEntry] : []) : allEntries;
   const list = entries.map((entry) => entry.item);
   const profile = getSettingProfileByGroup(group);
   if (screenItems) screenItems.classList.toggle("setting-screen-items--profile", Boolean(profile));
-  if (meta) meta.textContent = `${group} / ${list.length}`;
+  if (screenItems) screenItems.classList.toggle("setting-screen-items--detail", detailMode);
+  CURRENT_SETTING_DETAIL = detailMode ? detailName : null;
   const groupLabel = getSettingGroupLabel(group);
-  settingTitle.textContent = (UI_STRINGS[LANG].setting || "Setting") + " - " + groupLabel;
-  if (itemsTitle) itemsTitle.textContent = groupLabel;
+  const detailTitle = detailMode && list[0] ? getSettingDetailTitle(list[0]) : "";
+  settingTitle.textContent = (UI_STRINGS[LANG].setting || "Setting") + " - " + (detailTitle || groupLabel);
+  setSettingItemsTitle(detailTitle || groupLabel);
+  if (meta) {
+    meta.classList.remove("setting-profile-meta");
+    meta.textContent = profile && !detailMode ? "" : `${group} / ${detailMode ? "1" : list.length}`;
+  }
 
   let values = {};
   try {
@@ -2193,7 +2672,30 @@ async function renderItems(group, options = {}) {
     values = {};
   }
 
-  if (renderToken !== settingRenderToken || CURRENT_GROUP !== group || !isCarrotSettingTabActive() || screenItems?.style.display === "none") {
+  if (
+    renderToken !== settingRenderToken ||
+    CURRENT_GROUP !== group ||
+    !isCarrotSettingTabActive() ||
+    (!allowHidden && screenItems?.style.display === "none")
+  ) {
+    return;
+  }
+
+  if (!list.length && detailMode) {
+    const empty = document.createElement("div");
+    empty.className = "setting-favorites-empty";
+    const emptyTitle = document.createElement("div");
+    emptyTitle.className = "setting-favorites-empty__title";
+    emptyTitle.textContent = getUIText("setting_not_found", "Setting not found");
+    const emptyDesc = document.createElement("div");
+    emptyDesc.className = "setting-favorites-empty__desc";
+    emptyDesc.textContent = detailName;
+    empty.appendChild(emptyTitle);
+    empty.appendChild(emptyDesc);
+    itemsBox.appendChild(empty);
+    itemsBox.dataset.renderedGroup = group;
+    itemsBox.dataset.renderedDetail = detailName;
+    requestAnimationFrame(resetSettingItemsViewport);
     return;
   }
 
@@ -2217,7 +2719,7 @@ async function renderItems(group, options = {}) {
     return;
   }
 
-  if (profile) appendSettingProfileHeader(profile, itemsBox);
+  if (profile && !detailMode) appendSettingProfileHeader(profile, itemsBox);
 
   const profileSectionCounts = new Map();
   if (profile) {
@@ -2227,15 +2729,61 @@ async function renderItems(group, options = {}) {
   }
   let lastProfileGroup = "";
   let currentProfileSectionBody = null;
+  let lastCategorySectionKey = null;
+  let currentCategoryCardBody = null;
+
+  // 즐겨찾기도 다른 하위메뉴와 같은 카드 박스(공통분모: setting-section-block +
+  // setting-group-card)에 담는다. 즐겨찾기는 소-섹션이 섞여 있으므로 단일 카드 1개로.
+  if (!detailMode && isSettingFavoritesGroup(group) && list.length) {
+    const favBlock = document.createElement("section");
+    favBlock.className = animateItems ? "setting-section-block ui-stagger-item" : "setting-section-block";
+    if (animateItems) favBlock.style.setProperty("--i", "1");
+    const favCard = document.createElement("div");
+    favCard.className = "setting-group-card";
+    const favBody = document.createElement("div");
+    favBody.className = "setting-group-card__body";
+    favCard.appendChild(favBody);
+    favBlock.appendChild(favCard);
+    itemsBox.appendChild(favBlock);
+    currentCategoryCardBody = favBody;
+  }
+
   list.forEach((p, index) => {
     const name = p.name;
     const originGroup = entries[index]?.group || group;
-    if (!(name in UNIT_INDEX)) UNIT_INDEX[name] = 0;
+    getSettingUnitIndex(name);
 
-    if (profile && originGroup !== lastProfileGroup) {
+    // 카테고리 모드: 소-섹션마다 카드(그룹박스) 생성 (프로필/즐겨찾기 뷰 제외).
+    // 라벨이 있으면 카드 제목으로, 없으면(단일 직속 섹션) 제목 없는 카드.
+    if (!detailMode && !profile && !isSettingFavoritesGroup(group) && p.__section) {
+      const secKey = p.__section.id || "";
+      if (secKey !== lastCategorySectionKey) {
+        lastCategorySectionKey = secKey;
+        const sectionBlock = document.createElement("section");
+        sectionBlock.className = animateItems ? "setting-section-block ui-stagger-item" : "setting-section-block";
+        if (animateItems) sectionBlock.style.setProperty("--i", String(Math.min(index + 1, 14)));
+        const cardLabel = settingNodeLabel(p.__section);
+        if (cardLabel) {
+          const cardTitle = document.createElement("div");
+          cardTitle.className = "setting-group-card__title";
+          cardTitle.textContent = cardLabel;
+          sectionBlock.appendChild(cardTitle);
+        }
+        const card = document.createElement("div");
+        card.className = "setting-group-card";
+        const cardBody = document.createElement("div");
+        cardBody.className = "setting-group-card__body";
+        card.appendChild(cardBody);
+        sectionBlock.appendChild(card);
+        itemsBox.appendChild(sectionBlock);
+        currentCategoryCardBody = cardBody;
+      }
+    }
+
+    if (!detailMode && profile && originGroup !== lastProfileGroup) {
       lastProfileGroup = originGroup;
       const section = document.createElement("div");
-      section.className = animateItems ? "setting-profile-section ui-stagger-item" : "setting-profile-section";
+      section.className = animateItems ? "setting-section-block setting-profile-section ui-stagger-item" : "setting-section-block setting-profile-section";
       if (animateItems) section.style.setProperty("--i", String(Math.min(index + 1, 14)));
       const stateKey = `${profile.id}:${originGroup}`;
       const expanded = settingProfileSectionExpandedState.has(stateKey)
@@ -2259,7 +2807,7 @@ async function renderItems(group, options = {}) {
       const body = document.createElement("div");
       body.className = "setting-profile-section__body";
       const bodyInner = document.createElement("div");
-      bodyInner.className = "setting-profile-section__bodyInner";
+      bodyInner.className = "setting-group-card setting-group-card__body setting-profile-section__bodyInner";
       header.onclick = () => {
         const wasCollapsed = section.classList.contains("is-collapsed");
         const nextExpanded = wasCollapsed;
@@ -2286,6 +2834,7 @@ async function renderItems(group, options = {}) {
 
     const title = formatItemText(p, "title", "etitle", "");
     const descr = formatItemText(p, "descr", "edescr", "");
+    const rangeMeta = formatSettingRangeMeta(p);
 
     const el = document.createElement("div");
     el.className = animateItems ? "setting ui-stagger-item" : "setting";
@@ -2306,42 +2855,119 @@ async function renderItems(group, options = {}) {
       </div>
       ${settingMarqueeHtml(name, "name")}
       <div class="muted mt-sm">
-        min=${p.min}, max=${p.max}, default=${p.default}
+        ${escapeHtml(rangeMeta)}
       </div>
     `;
 
+    const controlConfig = getSettingControlConfig(p);
+    const compactNumeric = !detailMode && controlConfig.kind === "slider";
     const ctrl = document.createElement("div");
-    ctrl.className = "ctrl";
-
-    const btnMinus = document.createElement("button");
-    btnMinus.type = "button";
-    btnMinus.className = "smallBtn";
-    btnMinus.textContent = "-";
+    ctrl.className = `ctrl ctrl--${compactNumeric ? "value" : controlConfig.kind}`;
 
     const val = document.createElement("button");
     val.type = "button";
-    val.className = "pill val";
-    val.setAttribute("aria-label", getUIText("setting_value_edit", "Edit value"));
+    val.className = compactNumeric ? "pill val setting-value-compact" : "pill val";
+    val.setAttribute("aria-label", compactNumeric
+      ? getUIText("setting_value_detail", "Open detail")
+      : getUIText("setting_value_edit", "Edit value"));
 
-    const btnPlus = document.createElement("button");
-    btnPlus.type = "button";
-    btnPlus.className = "smallBtn";
-    btnPlus.textContent = "+";
+    let btnMinus = null;
+    let btnPlus = null;
+    let unitBtn = null;
+    let sliderInput = null;
+    let toggleInput = null;
+    let selectInput = null;
+    const segmentButtons = [];
 
-    const unitBtn = document.createElement("button");
-    unitBtn.type = "button";
-    unitBtn.className = "smallBtn";
-    unitBtn.textContent = "x" + UNIT_CYCLE[UNIT_INDEX[name]];
+    if (controlConfig.kind === "toggle") {
+      const switchLabel = document.createElement("label");
+      switchLabel.className = "setting-switch";
+      toggleInput = document.createElement("input");
+      toggleInput.type = "checkbox";
+      toggleInput.className = "setting-switch__input";
+      toggleInput.setAttribute("aria-label", title || name);
+      const switchTrack = document.createElement("span");
+      switchTrack.className = "setting-switch__track";
+      switchLabel.appendChild(toggleInput);
+      switchLabel.appendChild(switchTrack);
+      ctrl.appendChild(switchLabel);
+      ctrl.appendChild(val);
+    } else if (controlConfig.kind === "segmented") {
+      const segmentWrap = document.createElement("div");
+      segmentWrap.className = "setting-segments";
+      getSettingOptionValues(controlConfig).forEach((optionValue) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "setting-segment";
+        button.dataset.value = String(optionValue);
+        button.textContent = getSettingOptionLabel(name, optionValue);
+        button.setAttribute("aria-pressed", "false");
+        segmentButtons.push(button);
+        segmentWrap.appendChild(button);
+      });
+      ctrl.appendChild(segmentWrap);
+      ctrl.appendChild(val);
+    } else if (controlConfig.kind === "select") {
+      selectInput = document.createElement("button");
+      selectInput.type = "button";
+      selectInput.className = "setting-select setting-select--button";
+      selectInput.setAttribute("aria-label", title || name);
+      selectInput.setAttribute("aria-haspopup", "dialog");
+      ctrl.appendChild(selectInput);
+      ctrl.appendChild(val);
+    } else if (compactNumeric) {
+      btnMinus = document.createElement("button");
+      btnMinus.type = "button";
+      btnMinus.className = "smallBtn setting-value-arrow setting-value-arrow--prev";
+      btnMinus.textContent = "-";
+      btnMinus.setAttribute("aria-label", getUIText("setting_value_previous", "Previous value"));
 
-    unitBtn.onclick = () => {
-      UNIT_INDEX[name] = (UNIT_INDEX[name] + 1) % UNIT_CYCLE.length;
-      unitBtn.textContent = "x" + UNIT_CYCLE[UNIT_INDEX[name]];
-    };
+      btnPlus = document.createElement("button");
+      btnPlus.type = "button";
+      btnPlus.className = "smallBtn setting-value-arrow setting-value-arrow--next";
+      btnPlus.textContent = "+";
+      btnPlus.setAttribute("aria-label", getUIText("setting_value_next", "Next value"));
 
-    ctrl.appendChild(btnMinus);
-    ctrl.appendChild(val);
-    ctrl.appendChild(btnPlus);
-    ctrl.appendChild(unitBtn);
+      unitBtn = document.createElement("button");
+      unitBtn.type = "button";
+      unitBtn.className = "setting-unit-cycle";
+      setSettingUnitButtonLabel(unitBtn, name);
+
+      ctrl.appendChild(btnMinus);
+      ctrl.appendChild(val);
+      ctrl.appendChild(btnPlus);
+    } else {
+      const sliderWrap = document.createElement("div");
+      sliderWrap.className = "setting-slider";
+      sliderInput = document.createElement("input");
+      sliderInput.type = "range";
+      sliderInput.className = "setting-slider__input";
+      sliderInput.min = String(controlConfig.min);
+      sliderInput.max = String(controlConfig.max);
+      sliderInput.step = String(controlConfig.unit);
+      sliderInput.setAttribute("aria-label", title || name);
+      sliderWrap.appendChild(sliderInput);
+
+      btnMinus = document.createElement("button");
+      btnMinus.type = "button";
+      btnMinus.className = "smallBtn setting-step setting-step--minus";
+      btnMinus.textContent = "-";
+
+      btnPlus = document.createElement("button");
+      btnPlus.type = "button";
+      btnPlus.className = "smallBtn setting-step setting-step--plus";
+      btnPlus.textContent = "+";
+
+      unitBtn = document.createElement("button");
+      unitBtn.type = "button";
+      unitBtn.className = "setting-unit-cycle";
+      setSettingUnitButtonLabel(unitBtn, name);
+
+      ctrl.appendChild(sliderWrap);
+      ctrl.appendChild(btnMinus);
+      ctrl.appendChild(val);
+      ctrl.appendChild(btnPlus);
+    }
 
     top.appendChild(left);
     top.appendChild(ctrl);
@@ -2352,10 +2978,15 @@ async function renderItems(group, options = {}) {
 
     el.appendChild(top);
     el.appendChild(d);
-    (currentProfileSectionBody || itemsBox).appendChild(el);
+    if (unitBtn) {
+      el.classList.add("setting--has-unit-cycle");
+      el.appendChild(unitBtn);
+    }
+    (currentProfileSectionBody || currentCategoryCardBody || itemsBox).appendChild(el);
 
     const cur = (name in values) ? values[name] : p.default;
-    val.textContent = String(cur);
+    syncSettingControlState(el, cur);
+    val.dataset.committedValue = String(cur);
 
     function normalizeSettingValue(raw) {
       const text = String(raw).trim();
@@ -2386,7 +3017,8 @@ async function renderItems(group, options = {}) {
         } else {
           await setParam(name, next);
         }
-        val.textContent = String(next);
+        syncSettingControlState(el, next);
+        val.dataset.committedValue = String(next);
         if (!profile) {
           cacheSettingValue(name, next, group);
           if (originGroup !== group) cacheSettingValue(name, next, originGroup);
@@ -2396,77 +3028,215 @@ async function renderItems(group, options = {}) {
       }
     }
 
-    async function editValueDirect() {
-      const input = await appPrompt(
-        getUIText("setting_value_prompt", "Enter value for {name}\nRange: {min} - {max}", {
-          name,
-          min: p.min,
-          max: p.max,
-        }),
-        {
-          title: getUIText("setting_value_title", "Edit value"),
-          defaultValue: val.textContent,
-          placeholder: String(p.default),
-          confirmLabel: getUIText("ok", "OK"),
-          showCancel: false,
-          defaultActionLabel: getUIText("default_value", "Default"),
-          defaultActionValue: { settingDefaultAction: true, value: String(p.default) },
-        }
-      );
-      if (input === null) return;
-
-      if (input?.settingDefaultAction) {
-        const defaultValue = input.value;
-        const ok = await appConfirm(getUIText(
-          "default_value_confirm",
-          "Restore {name} to default value ({value})?",
-          { name, value: defaultValue }
-        ), {
-          title: getUIText("default_value", "Default"),
-          confirmLabel: getUIText("ok", "OK"),
-        });
-        if (!ok) return;
-
-        const nextDefault = normalizeSettingValue(defaultValue);
-        if (nextDefault === null) {
-          showAppToast(getUIText("setting_value_invalid", "Enter a valid number."), { tone: "error" });
-          return;
-        }
-        if (String(nextDefault) === String(val.textContent)) return;
-        await commitSettingValue(nextDefault);
-        return;
-      }
-
-      const next = normalizeSettingValue(input);
-      if (next === null) {
-        showAppToast(getUIText("setting_value_invalid", "Enter a valid number."), { tone: "error" });
-        return;
-      }
-      if (String(next) === String(val.textContent)) return;
-      await commitSettingValue(next);
-    }
-
     async function applyDelta(sign) {
-      const step = UNIT_CYCLE[UNIT_INDEX[name]];
-      let curv = Number(val.textContent);
+      const step = getSettingUnitValue(name);
+      let curv = Number(val.dataset.rawValue);
       if (Number.isNaN(curv)) curv = Number(p.default);
 
       let next = curv + sign * step;
       next = clamp(next, Number(p.min), Number(p.max));
 
-      if (Number.isInteger(p.min) && Number.isInteger(p.max) && Number.isInteger(step)) {
+      if (Number.isInteger(Number(p.min)) && Number.isInteger(Number(p.max)) && Number.isInteger(step)) {
         next = Math.round(next);
       }
 
       await commitSettingValue(next);
     }
 
-    btnMinus.onclick = () => applyDelta(-1);
-    val.onclick = editValueDirect;
-    btnPlus.onclick = () => applyDelta(+1);
+    let deltaBusy = false;
+    async function requestDelta(sign) {
+      if (deltaBusy) return;
+      deltaBusy = true;
+      try {
+        await applyDelta(sign);
+      } finally {
+        deltaBusy = false;
+      }
+    }
+
+    function bindDeltaButton(button, sign) {
+      if (!button) return;
+
+      let holdTimer = null;
+      let repeatTimer = null;
+      let pointerActive = false;
+      let activePointerId = null;
+      let suppressClickUntil = 0;
+      const holdDelayMs = 900;
+      const repeatDelayMs = 160;
+      const clickSuppressMs = 450;
+
+      function clearTimers() {
+        if (holdTimer) {
+          clearTimeout(holdTimer);
+          holdTimer = null;
+        }
+        if (repeatTimer) {
+          clearTimeout(repeatTimer);
+          repeatTimer = null;
+        }
+      }
+
+      function stopHold() {
+        clearTimers();
+        pointerActive = false;
+        button.classList.remove("is-holding");
+        if (activePointerId !== null && typeof button.releasePointerCapture === "function") {
+          try {
+            button.releasePointerCapture(activePointerId);
+          } catch (_) {
+            /* pointer capture may already be released by the browser */
+          }
+        }
+        activePointerId = null;
+      }
+
+      function repeatDelta() {
+        if (!pointerActive) return;
+        requestDelta(sign);
+        repeatTimer = window.setTimeout(repeatDelta, repeatDelayMs);
+      }
+
+      button.addEventListener("pointerdown", (event) => {
+        if (event.button !== undefined && event.button !== 0) return;
+        event.stopPropagation();
+        event.preventDefault();
+        stopHold();
+        pointerActive = true;
+        activePointerId = event.pointerId;
+        suppressClickUntil = Date.now() + clickSuppressMs;
+        button.classList.add("is-holding");
+        if (typeof button.setPointerCapture === "function") {
+          try {
+            button.setPointerCapture(activePointerId);
+          } catch (_) {
+            /* pointer capture is best-effort for repeated input */
+          }
+        }
+        requestDelta(sign);
+        holdTimer = window.setTimeout(repeatDelta, holdDelayMs);
+      });
+
+      button.addEventListener("pointerup", (event) => {
+        event.stopPropagation();
+        suppressClickUntil = Date.now() + clickSuppressMs;
+        stopHold();
+      });
+      button.addEventListener("pointercancel", stopHold);
+      button.addEventListener("lostpointercapture", stopHold);
+      button.addEventListener("click", (event) => {
+        event.stopPropagation();
+        if (Date.now() < suppressClickUntil) {
+          event.preventDefault();
+          return;
+        }
+        requestDelta(sign);
+      });
+    }
+
+    async function promptSettingValue() {
+      const input = await appPrompt(
+        rangeMeta,
+        {
+          title: title || name,
+          defaultValue: val.dataset.rawValue ?? String(p.default),
+          placeholder: String(p.default),
+          confirmLabel: getUIText("ok", "OK"),
+          cancelLabel: getUIText("cancel", "Cancel"),
+          showCancel: true,
+        },
+      );
+      if (input === null) return;
+      const next = normalizeSettingValue(input);
+      if (next === null) {
+        showAppToast(getUIText("setting_value_invalid", "Enter a valid number."), { tone: "error" });
+        return;
+      }
+      if (String(next) === String(val.dataset.rawValue)) return;
+      await commitSettingValue(next);
+    }
+
+    async function promptSettingChoice() {
+      const current = String(val.dataset.rawValue ?? p.default);
+      const choices = getSettingOptionValues(controlConfig).map((optionValue) => {
+        const optionText = String(optionValue);
+        const isCurrent = optionText === current;
+        return {
+          label: getSettingOptionLabel(name, optionValue),
+          value: optionText,
+          selected: isCurrent,
+          className: "setting-choice-option",
+        };
+      });
+      const selected = await openAppDialog({
+        mode: "choice",
+        choiceLayout: "value-grid",
+        title: title || name,
+        html: true,
+        messageHtml: `<div class="setting-choice-dialog">${escapeHtml(name)}<br>${escapeHtml(rangeMeta)}</div>`,
+        choices,
+        cancelLabel: getUIText("cancel", "Cancel"),
+        showCancel: true,
+      });
+      if (selected === null) return;
+      const next = normalizeSettingValue(selected);
+      if (next === null || String(next) === String(val.dataset.rawValue)) return;
+      await commitSettingValue(next);
+    }
+
+    if (toggleInput) {
+      toggleInput.onchange = () => {
+        commitSettingValue(toggleInput.checked ? 1 : 0);
+      };
+    }
+
+    if (unitBtn) {
+      unitBtn.onclick = (event) => {
+        event.stopPropagation();
+        cycleSettingUnitValue(name);
+        setSettingUnitButtonLabel(unitBtn, name);
+      };
+    }
+
+    bindDeltaButton(btnMinus, -1);
+    bindDeltaButton(btnPlus, +1);
+
+    val.onclick = (event) => {
+      event.stopPropagation();
+      if (controlConfig.kind === "slider") promptSettingValue();
+    };
+
+    segmentButtons.forEach((button) => {
+      button.onclick = (event) => {
+        event.stopPropagation();
+        const next = normalizeSettingValue(button.dataset.value);
+        if (next === null || String(next) === String(val.dataset.rawValue)) return;
+        commitSettingValue(next);
+      };
+    });
+
+    if (selectInput) {
+      selectInput.onclick = (event) => {
+        event.stopPropagation();
+        promptSettingChoice();
+      };
+    }
+
+    if (sliderInput) {
+      sliderInput.oninput = () => {
+        const next = normalizeSettingValue(sliderInput.value);
+        if (next !== null) syncSettingControlState(el, next);
+      };
+      sliderInput.onchange = () => {
+        const next = normalizeSettingValue(sliderInput.value);
+        if (next === null || String(next) === String(val.dataset.committedValue ?? val.dataset.rawValue)) return;
+        commitSettingValue(next);
+      };
+    }
   });
 
   itemsBox.dataset.renderedGroup = group;
+  if (detailMode) itemsBox.dataset.renderedDetail = detailName;
   scheduleSettingOverflowSync(itemsBox);
 
   if (pendingSettingFocus?.group === group) {
@@ -2498,7 +3268,7 @@ function bindSettingFavoriteLongPress() {
   }
 
   function isIgnoredFavoritePressTarget(target) {
-    return Boolean(target?.closest?.(".ctrl, button, input, select, textarea, a"));
+    return isSettingInlineControlTarget(target);
   }
 
   itemsBox.addEventListener("pointerdown", (event) => {
@@ -2519,6 +3289,10 @@ function bindSettingFavoriteLongPress() {
         if (!press || press.row !== row) return;
         press.fired = true;
         row.classList.remove("is-longpressing");
+        row.dataset.settingSuppressClick = "1";
+        window.setTimeout(() => {
+          if (row.dataset.settingSuppressClick === "1") delete row.dataset.settingSuppressClick;
+        }, 420);
         toggleSettingFavorite(row.dataset.settingName).catch(() => {});
       }, SETTING_FAVORITES_LONG_PRESS_MS),
     };
@@ -2584,7 +3358,11 @@ async function syncSettingViewportLayout(options = {}) {
     syncSettingGroupChrome(targetGroup);
     if (typeof centerActiveSettingSubnavTab === "function") centerActiveSettingSubnavTab("auto");
     if (!hasRenderedSettingItems(targetGroup)) {
-      await renderItems(targetGroup, { scrollMode: "restore", animateItems });
+      await renderItems(targetGroup, {
+        detailName: CURRENT_SETTING_DETAIL || "",
+        scrollMode: "restore",
+        animateItems,
+      });
     }
     return;
   }
@@ -2594,7 +3372,11 @@ async function syncSettingViewportLayout(options = {}) {
     showSettingScreen("items", false);
     if (typeof centerActiveSettingSubnavTab === "function") centerActiveSettingSubnavTab("auto");
     if (!hasRenderedSettingItems(CURRENT_GROUP)) {
-      await renderItems(CURRENT_GROUP, { scrollMode: "restore", animateItems });
+      await renderItems(CURRENT_GROUP, {
+        detailName: CURRENT_SETTING_DETAIL || "",
+        scrollMode: "restore",
+        animateItems,
+      });
     }
   } else {
     showSettingScreen("groups", false);
@@ -2638,6 +3420,7 @@ window.addEventListener("carrot:paramsrestored", (event) => {
   settingRestoreRefreshTimer = window.setTimeout(() => {
     settingRestoreRefreshTimer = null;
     renderItems(CURRENT_GROUP, {
+      detailName: CURRENT_SETTING_DETAIL || "",
       forceValues: true,
       scrollMode: "restore",
       scrollTop: currentTop,
