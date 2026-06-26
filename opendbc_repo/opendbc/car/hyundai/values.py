@@ -617,7 +617,7 @@ class CAR(Platforms):
   )
   KIA_EV4 = HyundaiCanFDPlatformConfig(
     [HyundaiCarDocs("Kia EV4 2025", "All", car_parts=CarParts.common([CarHarness.hyundai_q]))],
-    CarSpecs(mass=1710, wheelbase=2.83, steerRatio=14.5, tireStiffnessFactor=0.65),
+    CarSpecs(mass=1710, wheelbase=2.83, steerRatio=14.28, tireStiffnessFactor=0.98),
     flags=HyundaiFlags.EV,
   )
   KIA_EV6 = HyundaiCanFDPlatformConfig(
